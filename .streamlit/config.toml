@@ -1,0 +1,6 @@
+[client]
+# Hide Streamlit's Deploy button (and other developer chrome).
+toolbarMode = "minimal"
+
+[browser]
+gatherUsageStats = false
