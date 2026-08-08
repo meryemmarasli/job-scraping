@@ -1,125 +1,55 @@
 # Job Scraping
 
-A Streamlit app that pulls AI / ML / training job postings from public job boards, extracts structured annotations, lets you review and edit them one by one, and exports everything as JSON.
+Full-stack app that finds job listings via online keyword search and/or board URL scraping, lets you review and annotate each job, and exports approved ones as JSON or CSV.
+
+## Stack
+
+- **Backend:** FastAPI, `requests` + BeautifulSoup, Playwright fallback
+- **Frontend:** React + Vite + Tailwind
+- **Storage:** local JSON file (`data/jobs.json`) — no database
 
 ## Quick start
 
+### Backend
+
 ```bash
-# from the project root
-python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+cd backend
+python3 -m venv ../.venv
+source ../.venv/bin/activate
 pip install -r requirements.txt
-streamlit run app.py
+playwright install chromium
+uvicorn main:app --reload --port 8000
 ```
 
-Then open **http://localhost:8501** in your browser.
+### Frontend
 
-## How to use it
+```bash
+cd frontend
+npm install
+npm run dev
+```
 
-1. **Keywords** (sidebar) — defaults cover AI training / ML roles. Edit freely (comma or newline separated), or click **Reset keywords to defaults**.
-2. **Fetch live jobs** — pulls matching postings from public APIs (default import size is ~75).
-3. **Review** — use **← Back** / **Next →** to walk through jobs. Left side shows the job preview; right side has editable annotations.
-4. **Save** — use **Save & Next →** or **Save only** to write corrections to the local SQLite backend (`data/jobs.db`).
-5. **Finish** — on the last job, click **Finish →** to download all jobs as JSON (or reviewed-only).
-
-You can also paste specific job URLs and scrape those pages directly. Optional checkbox keeps only URL results that match your keywords.
+Open **http://localhost:5173**
 
 ## How it works
 
-```
-Keywords / URLs
-      │
-      ▼
- Public job APIs  ──or──  HTML page scrape
-      │
-      ▼
- Annotation extraction (title, company, location, skills, …)
-      │
-      ▼
- SQLite store  ←→  Streamlit review UI (edit / next / back)
-      │
-      ▼
- JSON export
-```
+1. **Filters (left)** — enter keywords (required; filter every result), pick a source, then start:
+   - **Online** — Remotive, RemoteOK, Arbeitnow, Jobicy
+   - **Boards** — careers pages you paste (still keyword-filtered)
+   - **Both** — online first, then your boards
+2. **Collect** — backend streams progress until the minimum is met (with safety caps). Board scrapes use static HTML first, Playwright if JS-heavy.
+3. **Review (right)** — one job at a time: preview + editable annotations. **Save** approves; **Delete / Skip** discards (excluded from export). Arrow keys navigate.
+4. **Download** — anytime from the top bar: approved (`saved`) jobs only, as JSON or CSV.
 
-| File | Role |
-|------|------|
-| `app.py` | Streamlit UI: fetch, review, edit, export |
-| `live_jobs.py` | Live pulls from public job APIs + keyword matching |
-| `scraper.py` | Scrape a single job URL and extract fields |
-| `storage.py` | SQLite persistence for annotations |
-| `models.py` | Shared job / annotation schema |
+## API
 
-Extracted fields include title, company, location, employment type, remote/on-site, salary, skills, requirements, description, and source URL. Edits are saved locally so you can leave and come back.
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/state` | Jobs + scrape status |
+| POST | `/api/scrape/start` | Start scrape |
+| GET | `/api/scrape/progress` | SSE progress stream |
+| POST | `/api/jobs/{id}/save` | Save / approve |
+| POST | `/api/jobs/{id}/delete` | Skip / discard |
+| GET | `/api/export?format=json\|csv` | Download approved jobs |
 
-## How jobs are pulled
-
-### Live fetch (main path)
-
-**Fetch live jobs** calls public JSON APIs (no browser automation):
-
-| Source | Endpoint / approach |
-|--------|---------------------|
-| [Remotive](https://remotive.com) | `/api/remote-jobs` plus keyword search queries |
-| [RemoteOK](https://remoteok.com) | `/api` job feed |
-| [Arbeitnow](https://www.arbeitnow.com) | `/api/job-board-api` across multiple pages |
-| [Jobicy](https://jobicy.com) | `/api/v2/remote-jobs` with keyword-derived tags |
-
-Flow:
-
-1. Request listings from each selected source.
-2. Keep postings that match **at least one** of your keywords in the title, description, or tags.
-3. Short keywords like `AI` / `ML` / `NLP` only match **title + tags** (not long description boilerplate), so results stay on-target.
-4. Deduplicate by URL and by title+company.
-5. Prefer title matches, then return up to your **Max jobs to import** limit (default **75**).
-
-Default keywords include terms like `AI trainer`, `machine learning`, `LLM`, `RLHF`, `data labeling`, `prompt engineer`, and related phrases. Customize them anytime in the sidebar.
-
-### URL scrape (optional)
-
-Paste Greenhouse, Lever, or other public job page URLs. The scraper:
-
-1. Fetches the HTML.
-2. Prefers [schema.org `JobPosting`](https://schema.org/JobPosting) JSON-LD when present.
-3. Otherwise falls back to common page selectors + text heuristics.
-4. Optionally filters results with your keywords.
-
-LinkedIn / Indeed often block automated scrapes; company career pages and board APIs work more reliably.
-
-## Export format
-
-Downloaded JSON looks like:
-
-```json
-{
-  "exported_at": "2026-08-05T21:00:00+00:00",
-  "count": 75,
-  "jobs": [
-    {
-      "id": "...",
-      "created_at": "...",
-      "updated_at": "...",
-      "annotations": {
-        "title": "...",
-        "company": "...",
-        "location": "...",
-        "employment_type": "...",
-        "remote": "...",
-        "salary": "...",
-        "skills": "...",
-        "requirements": "...",
-        "description": "...",
-        "source_url": "...",
-        "reviewed": true
-      }
-    }
-  ]
-}
-```
-
-## Notes
-
-- Live listings depend on what the public APIs return that day; counts vary.
-- Please respect each board’s API terms (attribution / link-backs where required).
-- Local data lives under `data/` and is gitignored.
-- Streamlit’s Deploy button is hidden via `.streamlit/config.toml`.
+Progress survives refresh via `data/jobs.json`.
