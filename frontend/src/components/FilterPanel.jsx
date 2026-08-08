@@ -6,17 +6,23 @@ const SOURCES = [
   {
     id: 'online',
     label: 'Online',
-    hint: 'Remotive, RemoteOK, Arbeitnow, Jobicy',
+    hintTitle: 'Keyword search across public job boards',
+    hint:
+      'Looks up your keywords on Remotive, RemoteOK, Arbeitnow, and Jobicy. Best for a quick sweep of open listings.',
   },
   {
     id: 'urls',
     label: 'Boards',
-    hint: 'Careers pages you paste below',
+    hintTitle: 'Scrape specific career pages',
+    hint:
+      'Pulls jobs from the URLs you paste below (Mercor, Greenhouse, Lever, company careers pages, and similar). Use this when you already know which site to check.',
   },
   {
     id: 'both',
     label: 'Both',
-    hint: 'Online first, then your boards',
+    hintTitle: 'Public boards first, then your URLs',
+    hint:
+      'Runs the online keyword search, then scrapes your pasted board URLs to fill any remaining slots up to your minimum.',
   },
 ]
 
@@ -40,8 +46,8 @@ export default function FilterPanel({ onStart, disabled, scrape }) {
       if (mode === 'urls') return 'Scraping…'
       return 'Collecting…'
     }
-    if (mode === 'online') return 'Search online'
-    if (mode === 'urls') return 'Scrape boards'
+    if (mode === 'online') return 'Search public boards'
+    if (mode === 'urls') return 'Scrape my boards'
     return 'Search & scrape'
   }, [disabled, mode])
 
@@ -62,11 +68,11 @@ export default function FilterPanel({ onStart, disabled, scrape }) {
     setLocalError('')
 
     if (needsKeywords && !keywords.trim()) {
-      setLocalError('Add at least one keyword for online search.')
+      setLocalError('Add keywords to search public boards, or switch to Boards.')
       return
     }
     if (needsUrls && !cleanUrls.length) {
-      setLocalError('Add at least one board URL, or switch source to Online.')
+      setLocalError('Paste at least one board URL, or switch to Online.')
       return
     }
 
@@ -87,38 +93,12 @@ export default function FilterPanel({ onStart, disabled, scrape }) {
       <div>
         <h2 className="text-base font-semibold">Find jobs</h2>
         <p className="mt-1 text-sm text-[var(--muted)]">
-          Board scrapes work without keywords. Online search needs keywords. Contract roles only.
-        </p>
-      </div>
-
-      <div className="space-y-1.5">
-        <label className="block text-sm font-medium" htmlFor="keywords">
-          Keywords{' '}
-          {needsKeywords ? (
-            <span className="text-[var(--danger)]">*</span>
-          ) : (
-            <span className="font-normal text-[var(--muted)]">(optional)</span>
-          )}
-        </label>
-        <textarea
-          id="keywords"
-          value={keywords}
-          onChange={(e) => setKeywords(e.target.value)}
-          rows={3}
-          className="w-full rounded-lg border border-[var(--line)] bg-white px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
-          disabled={disabled}
-          placeholder="annotator, RLHF, data labeling"
-          required={needsKeywords}
-        />
-        <p className="text-xs text-[var(--muted)]">
-          {mode === 'urls'
-            ? 'Leave blank to pull all contract roles from your boards, or add keywords to narrow results.'
-            : 'Comma-separated. Used to find and filter listings (title + description).'}
+          Pick a source, set a minimum, then collect contract and labeling roles to review.
         </p>
       </div>
 
       <div className="space-y-2">
-        <span className="block text-sm font-medium">Source</span>
+        <span className="block text-sm font-medium">Where to look</span>
         <div
           className="grid grid-cols-3 gap-1 rounded-xl border border-[var(--line)] bg-[var(--surface)] p-1"
           role="radiogroup"
@@ -150,8 +130,41 @@ export default function FilterPanel({ onStart, disabled, scrape }) {
             )
           })}
         </div>
+        <div className="rounded-xl border border-[var(--line)] bg-[var(--surface)]/80 px-3 py-2.5">
+          <p className="text-sm font-medium text-[var(--ink)]">
+            {SOURCES.find((s) => s.id === mode)?.hintTitle}
+          </p>
+          <p className="mt-1 text-xs leading-relaxed text-[var(--muted)]">
+            {SOURCES.find((s) => s.id === mode)?.hint}
+          </p>
+        </div>
+      </div>
+
+      <div className="space-y-1.5">
+        <label className="block text-sm font-medium" htmlFor="keywords">
+          Keywords{' '}
+          {needsKeywords ? (
+            <span className="text-[var(--danger)]">*</span>
+          ) : (
+            <span className="font-normal text-[var(--muted)]">(optional)</span>
+          )}
+        </label>
+        <textarea
+          id="keywords"
+          value={keywords}
+          onChange={(e) => setKeywords(e.target.value)}
+          rows={3}
+          className="w-full rounded-lg border border-[var(--line)] bg-white px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+          disabled={disabled}
+          placeholder="annotator, RLHF, data labeling"
+          required={needsKeywords}
+        />
         <p className="text-xs text-[var(--muted)]">
-          {SOURCES.find((s) => s.id === mode)?.hint}
+          {mode === 'urls'
+            ? 'Optional. Leave blank to take every contract-style role on the page, or add terms to narrow the list.'
+            : mode === 'online'
+              ? 'Required. We’ll search public boards for these terms and keep matching contract-style roles.'
+              : 'Required for the online pass. Also used to filter jobs from your pasted URLs.'}
         </p>
       </div>
 
@@ -161,7 +174,7 @@ export default function FilterPanel({ onStart, disabled, scrape }) {
             <label className="text-sm font-medium">Board URLs</label>
             <span className="text-xs text-[var(--muted)]">
               {cleanUrls.length} added
-              {keywords.trim() ? ' · keyword-filtered' : ' · all contract roles'}
+              {keywords.trim() ? ' · filtered by keywords' : ' · no keyword filter'}
             </span>
           </div>
           <div className="space-y-2">
@@ -170,7 +183,7 @@ export default function FilterPanel({ onStart, disabled, scrape }) {
                 <input
                   value={row.value}
                   onChange={(e) => updateUrl(row.id, e.target.value)}
-                  placeholder="https://boards.greenhouse.io/…"
+                  placeholder="https://work.mercor.com/… or greenhouse.io/…"
                   className="w-full rounded-lg border border-[var(--line)] bg-white px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
                   disabled={disabled}
                   aria-label={`Board URL ${i + 1}`}
@@ -212,6 +225,9 @@ export default function FilterPanel({ onStart, disabled, scrape }) {
           className="w-full rounded-lg border border-[var(--line)] bg-white px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
           disabled={disabled}
         />
+        <p className="text-xs text-[var(--muted)]">
+          Keep collecting until this many matching roles are found, or sources run out.
+        </p>
       </div>
 
       {localError ? (

@@ -21,9 +21,10 @@ USER_AGENT = (
 )
 
 REQUEST_TIMEOUT = 25
-DELAY_SECONDS = 0.75
+DELAY_SECONDS = 0.55
 MAX_PAGES_PER_BOARD = 8
 MAX_TOTAL_FETCHES = 120
+MAX_LINKS_PER_PAGE = 80
 
 ProgressCallback = Callable[[dict], None]
 
@@ -103,6 +104,26 @@ _LABELING_PLATFORMS = (
 )
 
 
+_LABELING_ROLE_TERMS = (
+    "annotat",
+    "labeling",
+    "labelling",
+    "data label",
+    "rlhf",
+    "ai trainer",
+    "ai training",
+    "data contributor",
+    "expert network",
+    "preference rank",
+    "model evaluat",
+    "human feedback",
+    "red team",
+    "ocr specialist",
+    "prompt writer",
+    "llm evaluat",
+)
+
+
 def is_contract_job(
     title: str = "",
     description: str = "",
@@ -111,6 +132,7 @@ def is_contract_job(
     tags: list[str] | None = None,
     company: str = "",
     source: str = "",
+    allow_labeling_roles: bool = True,
 ) -> bool:
     """True when listing looks like contract / freelance / temporary work."""
     platform_blob = f"{company} {source}".lower()
@@ -132,7 +154,171 @@ def is_contract_job(
         return True
     if re.search(r"\btemp\b", blob) or re.search(r"\bgig\b", blob):
         return True
+    # Labeling / AI-trainer gigs are almost always contractor work even when
+    # the posting omits the word "contract".
+    if allow_labeling_roles and any(term in blob for term in _LABELING_ROLE_TERMS):
+        if not re.search(r"\bfull[- ]?time\b.*\bpermanent\b|\bpermanent\b.*\bfull[- ]?time\b", blob):
+            return True
     return False
+
+
+def extract_pay_rate(*texts: str, prefer_hourly: bool = True) -> str:
+    """
+    Pull the most likely pay figure from listing text.
+
+    Prefers explicit hourly rates (common for Mercor/Surge/Scale-style gigs)
+    over the first random $-amount on the page (funding, headcount, years, etc.).
+    """
+    blob = " ".join(t for t in texts if t)
+    if not blob:
+        return ""
+
+    # Normalize dashes / spacing so ranges parse cleanly.
+    normalized = (
+        blob.replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("–", "-")
+        .replace("—", "-")
+        .replace("／", "/")
+    )
+    normalized = re.sub(r"\s+", " ", normalized)
+
+    candidates: list[tuple[int, str]] = []
+
+    patterns = [
+        # $70-75/hr, $70 – $75 per hour, $45/hour, $90 to $110 an hour
+        (
+            100,
+            r"(\$\s?\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?(?:\s*(?:-|to)\s*\$?\s?\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)?\s*(?:/\s*h(?:r|our)?|per\s*hour|an\s*hour|hourly))",
+        ),
+        # 70-75 USD/hr, 45 USD per hour
+        (
+            95,
+            r"(\d{2,3}(?:\.\d{1,2})?\s*(?:(?:-|to)\s*\d{2,3}(?:\.\d{1,2})?)?\s*(?:USD|usd|US\$)\s*(?:/\s*h(?:r|our)?|per\s*hour))",
+        ),
+        # USD 70-75/hr
+        (
+            95,
+            r"((?:USD|US\$)\s*\d{2,3}(?:\.\d{1,2})?(?:\s*(?:-|to)\s*\d{2,3}(?:\.\d{1,2})?)?\s*(?:/\s*h(?:r|our)?|per\s*hour))",
+        ),
+        # Pay/rate/compensation: $70-75 or $90 to $110 nearby
+        (
+            90,
+            r"(?:(?:pay|rate|compensation|earning|wage|hourly)s?\s*(?:of|is|:|-)?\s*)"
+            r"(\$\s?\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?(?:\s*(?:-|to)\s*\$?\s?\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)?"
+            r"(?:\s*(?:/\s*h(?:r|our)?|per\s*hour|hourly|an\s*hour))?)",
+        ),
+        # Bare range with /hr and no $ : 40-60/hr
+        (
+            80,
+            r"(\b\d{2,3}(?:\.\d{1,2})?\s*(?:-|to)\s*\d{2,3}(?:\.\d{1,2})?\s*(?:/\s*h(?:r|our)?|per\s*hour)\b)",
+        ),
+        # Annual salary ranges when no hourly found
+        (
+            40,
+            r"(\$\s?\d{2,3}(?:,\d{3})+(?:\.\d{1,2})?(?:\s*(?:-|to)\s*\$?\s?\d{2,3}(?:,\d{3})+(?:\.\d{1,2})?)?\s*(?:/\s*(?:yr|year)|per\s*year|annually)?)",
+        ),
+        (
+            35,
+            r"((?:USD|US\$)\s*\d{2,3}(?:,\d{3})+(?:\s*(?:-|to)\s*\d{2,3}(?:,\d{3})+)?)",
+        ),
+    ]
+
+    for base_score, pattern in patterns:
+        for m in re.finditer(pattern, normalized, flags=re.I):
+            raw = _clean(m.group(1))
+            if not raw:
+                continue
+            start = max(0, m.start() - 40)
+            end = min(len(normalized), m.end() + 40)
+            ctx = normalized[start:end].lower()
+
+            score = base_score
+            if re.search(r"/\s*h(?:r|our)?|per\s*hour|hourly|an\s*hour", raw, re.I):
+                score += 25
+            if re.search(r"\b(pay|rate|compensation|wage|earning|hourly)\b", ctx):
+                score += 15
+            if re.search(r"/\s*(?:yr|year)|per\s*year|annually|salary", raw + " " + ctx, re.I):
+                score -= 10 if prefer_hourly else 0
+            # Reject obvious non-pay contexts
+            if re.search(
+                r"\b(founded|employees?|headcount|funding|raised|valuation|users?|models?)\b",
+                ctx,
+            ):
+                score -= 50
+            # Reject years like $2024
+            if re.search(r"\$?\s?20[1-3]\d\b", raw):
+                score -= 80
+
+            formatted = _format_pay(raw, prefer_hourly=prefer_hourly)
+            if not formatted:
+                continue
+            candidates.append((score, formatted))
+
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda x: (-x[0], len(x[1])))
+    best_score, best = candidates[0]
+    if best_score < 30:
+        return ""
+    return best[:120]
+
+
+def _format_pay(raw: str, prefer_hourly: bool = True) -> str:
+    """Normalize a matched pay string to a consistent display form."""
+    text = _clean(raw)
+    text = text.replace("US$", "USD")
+    text = re.sub(r"\s*-\s*", "-", text)
+    text = re.sub(r"\s+to\s+", "-", text, flags=re.I)
+    text = re.sub(r"\$\s+", "$", text)
+
+    hourly = bool(
+        re.search(r"/\s*h(?:r|our)?|per\s*hour|an\s*hour|hourly", text, re.I)
+    )
+    yearly = bool(re.search(r"/\s*(?:yr|year)|per\s*year|annually", text, re.I))
+
+    # Extract numeric parts
+    nums = re.findall(r"\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?", text)
+    if not nums:
+        return ""
+    values = []
+    for n in nums[:2]:
+        try:
+            values.append(float(n.replace(",", "")))
+        except ValueError:
+            continue
+    if not values:
+        return ""
+
+    # Drop absurd hourly candidates (e.g. $50000/hr misread)
+    if hourly and any(v > 500 for v in values):
+        hourly = False
+        yearly = True
+    # Labeling gigs: numbers 15–400 without unit are almost always hourly
+    if prefer_hourly and not hourly and not yearly and all(15 <= v <= 400 for v in values):
+        hourly = True
+    # Large numbers without unit → annual
+    if not hourly and not yearly and any(v >= 1000 for v in values):
+        yearly = True
+
+    def fmt(v: float) -> str:
+        if v >= 1000:
+            return f"${v:,.0f}"
+        if abs(v - int(v)) < 1e-6:
+            return f"${int(v)}"
+        return f"${v:.2f}".rstrip("0").rstrip(".")
+
+    if len(values) >= 2 and values[0] != values[1]:
+        lo, hi = (values[0], values[1]) if values[0] <= values[1] else (values[1], values[0])
+        core = f"{fmt(lo)}-{fmt(hi)}"
+    else:
+        core = fmt(values[0])
+
+    if hourly:
+        return f"{core}/hr"
+    if yearly:
+        return f"{core}/yr"
+    return core
 
 
 def enrich_labeling_fields(
@@ -154,24 +340,21 @@ def enrich_labeling_fields(
         "work_mode": "remote",
     }
 
-    # Pay / rate
-    pay = salary
-    if not pay:
-        m = re.search(
-            r"(\$\s?\d{1,3}(?:,\d{3})*(?:\.\d+)?(?:\s*[-–to]+\s*\$?\d{1,3}(?:,\d{3})*(?:\.\d+)?)?\s*(?:/\s*(?:hr|hour)|per\s*hour|hourly)?)",
-            blob,
-            flags=re.I,
-        )
-        if m:
-            pay = _clean(m.group(1))
+    # Pay / rate — prefer structured salary only if it already looks like pay;
+    # otherwise mine the listing for the best hourly/annual match.
+    structured = _format_pay(salary) if salary else ""
+    mined = extract_pay_rate(title, description, salary)
+    if structured and mined:
+        # Prefer hourly mined rate over annual API figures for contract gigs.
+        if "/hr" in mined and "/hr" not in structured:
+            pay = mined
+        elif "/hr" in structured:
+            pay = structured
         else:
-            m = re.search(
-                r"(\d{2,3}\s*[-–]\s*\d{2,3}\s*(?:USD|usd)?\s*(?:/\s*(?:hr|hour)|per\s*hour))",
-                blob,
-                flags=re.I,
-            )
-            if m:
-                pay = _clean(m.group(1))
+            # Prefer the more specific / complete string
+            pay = structured if len(structured) >= len(mined) else mined
+    else:
+        pay = structured or mined
     if pay:
         out["pay_rate"] = pay[:120]
         out["salary"] = pay[:120]
@@ -423,7 +606,7 @@ def looks_js_heavy_or_empty(html: str) -> bool:
     return False
 
 
-def extract_job_links(board_url: str, html: str, limit: int = 50) -> list[str]:
+def extract_job_links(board_url: str, html: str, limit: int = MAX_LINKS_PER_PAGE) -> list[str]:
     soup = BeautifulSoup(html, "lxml")
     parsed = urlparse(board_url)
     host = parsed.netloc.lower()
@@ -452,6 +635,8 @@ def extract_job_links(board_url: str, html: str, limit: int = 50) -> list[str]:
             looks_like_job = True
         elif "workable.com" in low_host and ("/j/" in path or "/jobs/" in path):
             looks_like_job = True
+        elif "mercor.com" in low_host and "/jobs/" in path and path.count("/") >= 2:
+            looks_like_job = True
         elif re.search(r"/(jobs?|careers?|positions?|openings?|vacancies)/.+", path, re.I):
             looks_like_job = True
         elif re.search(r"/(job|position|opening)[_-]?\w+", path, re.I):
@@ -459,7 +644,9 @@ def extract_job_links(board_url: str, html: str, limit: int = 50) -> list[str]:
 
         # Prefer same site for generic careers pages.
         if looks_like_job and host not in low_host and low_host not in host:
-            if not any(x in low_host for x in ("greenhouse", "lever", "ashby", "workable")):
+            if not any(
+                x in low_host for x in ("greenhouse", "lever", "ashby", "workable", "mercor")
+            ):
                 continue
 
         key = f"{fp.scheme}://{fp.netloc}{path}".lower()
@@ -536,14 +723,7 @@ def parse_job_page(url: str, html: str, source_board: str = "") -> Job:
             tag.decompose()
         description = _clean(soup.get_text(" ", strip=True))[:4000]
 
-    salary = ""
-    salary_match = re.search(
-        r"(\$\s?\d{1,3}(?:,\d{3})*(?:\.\d+)?(?:\s?[-–to]+\s?\$?\d{1,3}(?:,\d{3})*(?:\.\d+)?)?(?:\s*/\s*(?:yr|year|hr|hour))?)",
-        f"{title} {description}",
-        flags=re.I,
-    )
-    if salary_match:
-        salary = _clean(salary_match.group(1))
+    salary = extract_pay_rate(title, description)
 
     posted = ""
     date_match = re.search(
@@ -565,12 +745,14 @@ def parse_job_page(url: str, html: str, source_board: str = "") -> Job:
         salary=salary,
     )
 
+    pay = (extras.get("pay_rate") or salary)[:120]
+
     return Job(
         title=_clean(title)[:300],
         company=_clean(company)[:200],
         location=_clean(location)[:200],
-        salary=(extras.get("salary") or salary)[:120],
-        pay_rate=(extras.get("pay_rate") or salary)[:120],
+        salary=pay,
+        pay_rate=pay,
         description=_clean(description)[:5000],
         posted_date=posted[:120],
         url=url,
@@ -623,12 +805,17 @@ def scrape_jobs(
     """
     Scrape until min_jobs contract jobs are collected (or caps hit).
     Keywords are optional — when provided, listings must also match them.
+    Caps scale with min_jobs so larger targets keep digging.
     Returns (jobs, failed_urls).
     """
     collected: list[Job] = []
     seen_urls: set[str] = set()
     failed: list[dict] = []
     fetches = 0
+    target = max(1, int(min_jobs or 1))
+    max_pages = max(MAX_PAGES_PER_BOARD, min(40, target + 4))
+    max_fetches = max(MAX_TOTAL_FETCHES, min(400, target * 20))
+    link_limit = max(MAX_LINKS_PER_PAGE, min(200, target * 10))
 
     def progress(message: str, **extra):
         if on_progress:
@@ -636,7 +823,7 @@ def scrape_jobs(
                 {
                     "message": message,
                     "collected": len(collected),
-                    "target": min_jobs,
+                    "target": target,
                     **extra,
                 }
             )
@@ -657,18 +844,19 @@ def scrape_jobs(
 
     if not keywords:
         progress(
-            "Scraping boards (no keyword filter — contract roles only)…",
+            f"Scraping boards until {target} contract roles (no keyword filter)…",
             failed_urls=failed,
         )
     else:
         kw_label = ", ".join(keywords[:5])
         progress(
-            f"Scraping boards for contract roles (keywords: {kw_label})…",
+            f"Scraping boards until {target} contract roles (keywords: {kw_label})…",
             failed_urls=failed,
         )
 
+    # Keep walking every board until target is met (or caps / boards exhausted).
     for board in clean_urls:
-        if len(collected) >= min_jobs or fetches >= MAX_TOTAL_FETCHES:
+        if len(collected) >= target or fetches >= max_fetches:
             break
 
         if not robots_allowed(board):
@@ -681,23 +869,26 @@ def scrape_jobs(
 
         while (
             page_url
-            and pages_done < MAX_PAGES_PER_BOARD
-            and len(collected) < min_jobs
-            and fetches < MAX_TOTAL_FETCHES
+            and pages_done < max_pages
+            and len(collected) < target
+            and fetches < max_fetches
         ):
             try:
-                progress(f"Fetching {page_url}…")
+                progress(
+                    f"Fetching {page_url}… ({len(collected)}/{target})",
+                    failed_urls=failed,
+                )
                 time.sleep(DELAY_SECONDS)
                 html, final_url, method = scrape_url_once(page_url)
                 fetches += 1
                 pages_done += 1
 
-                links = extract_job_links(final_url, html)
+                links = extract_job_links(final_url, html, limit=link_limit)
                 # If no child links, treat the URL itself as a job page.
                 targets = links or [final_url]
 
                 for link in targets:
-                    if len(collected) >= min_jobs or fetches >= MAX_TOTAL_FETCHES:
+                    if len(collected) >= target or fetches >= max_fetches:
                         break
                     key = link.rstrip("/").lower()
                     if key in seen_urls:
@@ -709,7 +900,9 @@ def scrape_jobs(
                         time.sleep(DELAY_SECONDS)
                         job_html, job_final, _ = scrape_url_once(link)
                         fetches += 1
-                        job = parse_job_page(job_final, job_html, source_board=urlparse(board).netloc)
+                        job = parse_job_page(
+                            job_final, job_html, source_board=urlparse(board).netloc
+                        )
                         if not job.title:
                             continue
                         if not matches_keywords(job.title, job.description, keywords):
@@ -724,7 +917,7 @@ def scrape_jobs(
                         seen_urls.add(key)
                         collected.append(job)
                         progress(
-                            f"Collected {len(collected)} / {min_jobs} jobs…",
+                            f"Collected {len(collected)} / {target} jobs…",
                             failed_urls=failed,
                             method=method,
                         )
@@ -744,11 +937,18 @@ def scrape_jobs(
                 progress(f"Failed board {page_url}: {exc}", failed_urls=failed)
                 break
 
-    progress(
-        f"Done. Collected {len(collected)} / {min_jobs} matching jobs.",
-        failed_urls=failed,
-        finished=True,
-    )
+    if len(collected) < target:
+        progress(
+            f"Stopped at {len(collected)} / {target} — boards exhausted or fetch cap hit.",
+            failed_urls=failed,
+            finished=True,
+        )
+    else:
+        progress(
+            f"Done. Collected {len(collected)} / {target} matching jobs.",
+            failed_urls=failed,
+            finished=True,
+        )
     return collected, failed
 
 

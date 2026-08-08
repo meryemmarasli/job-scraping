@@ -127,6 +127,13 @@ def start_scrape(body: ScrapeRequest):
         error=None,
     )
 
+    # Fresh run: keep saved approvals, clear previous unreviewed/deleted so the
+    # annotation queue reflects this collection toward min_jobs.
+    def clear_queue(state):
+        state.jobs = [j for j in state.jobs if j.status == "saved"]
+
+    update_jobs(clear_queue)
+
     def on_progress(payload: dict):
         set_scrape_progress(
             running=not payload.get("finished", False),
@@ -141,12 +148,19 @@ def start_scrape(body: ScrapeRequest):
     # Combined runner for "both" or single-mode paths.
     def finish(jobs, failed):
         upsert_jobs(jobs)
-        zero = len(jobs) == 0
+        got = len(jobs)
+        zero = got == 0
+        short = got < body.min_jobs
         err = None
         if zero and failed:
             err = f"Search failed — no contract jobs collected ({len(failed)} source error(s))."
         elif zero:
             err = "No matching contract jobs found. Try different keywords or board URLs."
+        elif short:
+            err = (
+                f"Only found {got} of {body.min_jobs} requested. "
+                "Sources exhausted — try more boards, broader keywords, or Both mode."
+            )
         elif failed:
             err = f"Finished with {len(failed)} source warning(s)."
         set_scrape_progress(
@@ -154,10 +168,10 @@ def start_scrape(body: ScrapeRequest):
             finished=True,
             message=(
                 err
-                if zero
-                else f"Done. Collected {len(jobs)} matching contract jobs."
+                if (zero or short)
+                else f"Done. Collected {got} / {body.min_jobs} matching contract jobs."
             ),
-            collected=len(jobs),
+            collected=got,
             target=body.min_jobs,
             failed_urls=failed,
             error=err,

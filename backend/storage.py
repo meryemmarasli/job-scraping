@@ -62,13 +62,32 @@ def upsert_jobs(new_jobs: list[Job], *, replace_unreviewed: bool = False) -> App
                 continue
             if existing:
                 # Refresh scraped fields but keep annotations if any
-                existing.title = job.title or existing.title
-                existing.company = job.company or existing.company
-                existing.location = job.location or existing.location
-                existing.salary = job.salary or existing.salary
-                existing.description = job.description or existing.description
-                existing.posted_date = job.posted_date or existing.posted_date
-                existing.source_board = job.source_board or existing.source_board
+                for field in (
+                    "title",
+                    "company",
+                    "client_partner",
+                    "location",
+                    "salary",
+                    "pay_rate",
+                    "employment_type",
+                    "hours_per_week",
+                    "duration",
+                    "work_mode",
+                    "languages",
+                    "domain",
+                    "task_type",
+                    "responsibilities",
+                    "requirements",
+                    "preferred",
+                    "tools_skills",
+                    "screening",
+                    "description",
+                    "posted_date",
+                    "source_board",
+                ):
+                    value = getattr(job, field, None)
+                    if value:
+                        setattr(existing, field, value)
                 existing.updated_at = utc_now()
             else:
                 state.jobs.append(job)

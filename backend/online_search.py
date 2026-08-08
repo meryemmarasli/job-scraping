@@ -13,6 +13,7 @@ from models import Job
 from scraper import (
     USER_AGENT,
     enrich_labeling_fields,
+    extract_pay_rate,
     is_contract_job,
     matches_keywords,
     parse_keywords,
@@ -56,12 +57,14 @@ def _job(
         location=location,
         salary=salary,
     )
+    # Prefer structured API pay when it's real; otherwise use mined listing text.
+    pay = extras.get("pay_rate") or extract_pay_rate(title, description, salary) or _clean(salary)
     return Job(
         title=_clean(title)[:300],
         company=_clean(company)[:200],
         location=_clean(location)[:200],
-        salary=_clean(extras.get("salary") or salary)[:120],
-        pay_rate=_clean(extras.get("pay_rate") or salary)[:120],
+        salary=_clean(pay)[:120],
+        pay_rate=_clean(pay)[:120],
         description=_clean(description)[:5000],
         posted_date=_clean(posted_date)[:120],
         url=url,
@@ -86,7 +89,8 @@ def _job(
 def _from_remotive(keywords: List[str]) -> Tuple[List[Job], List[dict]]:
     jobs: List[Job] = []
     failed: List[dict] = []
-    queries = keywords[:6] or [""]
+    # Broad pull + per-keyword queries so we can fill min_jobs.
+    queries = list(dict.fromkeys([*keywords[:8], ""]))
     seen = set()
     for kw in queries:
         url = "https://remotive.com/api/remote-jobs"
@@ -125,7 +129,7 @@ def _from_remotive(keywords: List[str]) -> Tuple[List[Job], List[dict]]:
                         posted_date=str(item.get("publication_date") or ""),
                     )
                 )
-            time.sleep(0.25)
+            time.sleep(0.2)
         except Exception as exc:  # noqa: BLE001
             failed.append({"url": f"remotive:{kw or 'all'}", "error": str(exc)})
     return jobs, failed
@@ -154,8 +158,19 @@ def _from_remoteok(keywords: List[str]) -> Tuple[List[Job], List[dict]]:
                 continue
             salary = ""
             lo, hi = item.get("salary_min") or 0, item.get("salary_max") or 0
-            if lo or hi:
-                salary = f"USD {lo}-{hi}".replace("USD 0-0", "").strip()
+            try:
+                lo_n, hi_n = float(lo or 0), float(hi or 0)
+            except (TypeError, ValueError):
+                lo_n = hi_n = 0
+            if lo_n or hi_n:
+                # RemoteOK values are typically annual USD; keep /yr unless clearly hourly.
+                if lo_n and hi_n and max(lo_n, hi_n) <= 500:
+                    salary = f"${int(lo_n)}-${int(hi_n)}/hr" if lo_n != hi_n else f"${int(lo_n)}/hr"
+                elif lo_n and hi_n:
+                    salary = f"${int(lo_n):,}-${int(hi_n):,}/yr"
+                else:
+                    v = int(lo_n or hi_n)
+                    salary = f"${v}/hr" if v <= 500 else f"${v:,}/yr"
             jobs.append(
                 _job(
                     title=title,
@@ -173,7 +188,7 @@ def _from_remoteok(keywords: List[str]) -> Tuple[List[Job], List[dict]]:
     return jobs, failed
 
 
-def _from_arbeitnow(keywords: List[str], max_pages: int = 8) -> Tuple[List[Job], List[dict]]:
+def _from_arbeitnow(keywords: List[str], max_pages: int = 20) -> Tuple[List[Job], List[dict]]:
     jobs: List[Job] = []
     failed: List[dict] = []
     try:
@@ -238,16 +253,16 @@ def _from_jobicy(keywords: List[str]) -> Tuple[List[Job], List[dict]]:
         tag = re.sub(r"[^a-z0-9+-]+", "", re.sub(r"\s+", "-", kw.lower()))
         if 3 <= len(tag) <= 50 and tag not in tags:
             tags.append(tag)
-    for fallback in ("contract", "freelance", "consultant", "temporary"):
+    for fallback in ("contract", "freelance", "consultant", "temporary", "annotator", "labeling", "rlhf"):
         if fallback not in tags:
             tags.append(fallback)
 
     seen = set()
-    for tag in tags[:10]:
+    for tag in tags[:14]:
         try:
             resp = requests.get(
                 "https://jobicy.com/api/v2/remote-jobs",
-                params={"count": 50, "tag": tag},
+                params={"count": 100, "tag": tag},
                 headers=_headers(),
                 timeout=30,
             )
@@ -274,9 +289,23 @@ def _from_jobicy(keywords: List[str]) -> Tuple[List[Job], List[dict]]:
                 seen.add(key)
                 salary = ""
                 lo, hi = item.get("annualSalaryMin"), item.get("annualSalaryMax")
-                if lo or hi:
-                    currency = item.get("salaryCurrency") or "USD"
-                    salary = f"{currency} {lo or ''}-{hi or ''}".strip("- ")
+                try:
+                    lo_n = float(lo) if lo not in (None, "") else 0
+                    hi_n = float(hi) if hi not in (None, "") else 0
+                except (TypeError, ValueError):
+                    lo_n = hi_n = 0
+                if lo_n or hi_n:
+                    currency = (item.get("salaryCurrency") or "USD").upper()
+                    prefix = "$" if currency in ("USD", "US$") else f"{currency} "
+                    if lo_n and hi_n and lo_n != hi_n:
+                        salary = f"{prefix}{int(lo_n):,}-{prefix}{int(hi_n):,}/yr".replace(
+                            f"{prefix}{prefix}", prefix
+                        )
+                        # Avoid "$50,000-$60,000" doubling when prefix is $
+                        if prefix == "$":
+                            salary = f"${int(lo_n):,}-${int(hi_n):,}/yr"
+                    else:
+                        salary = f"{prefix}{int(lo_n or hi_n):,}/yr"
                 jobs.append(
                     _job(
                         title=title,
@@ -304,13 +333,15 @@ def search_online(
     if not keywords:
         return [], [{"url": "(keywords)", "error": "Add at least one keyword"}]
 
+    target = max(1, int(min_jobs or 1))
+
     def progress(message: str, collected: int = 0, **extra):
         if on_progress:
             on_progress(
                 {
                     "message": message,
                     "collected": collected,
-                    "target": min_jobs,
+                    "target": target,
                     **extra,
                 }
             )
@@ -319,51 +350,96 @@ def search_online(
     failed: List[dict] = []
     seen = set()
 
-    sources = [
-        ("Remotive", _from_remotive),
-        ("RemoteOK", _from_remoteok),
-        ("Arbeitnow", _from_arbeitnow),
-        ("Jobicy", _from_jobicy),
+    # Deeper Arbeitnow pagination when the user asks for more jobs.
+    arbeitnow_pages = max(12, min(40, target + 8))
+
+    def add_jobs(jobs: List[Job]) -> int:
+        added = 0
+        for job in jobs:
+            if len(collected) >= target:
+                break
+            key = (job.url or "").rstrip("/").lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            collected.append(job)
+            added += 1
+            progress(
+                f"Collected {len(collected)} / {target} jobs from online search…",
+                len(collected),
+                failed_urls=failed,
+            )
+        return added
+
+    # Round 1: standard sources. Round 2: deeper Arbeitnow if still short.
+    source_passes = [
+        [
+            ("Remotive", lambda: _from_remotive(keywords)),
+            ("RemoteOK", lambda: _from_remoteok(keywords)),
+            ("Arbeitnow", lambda: _from_arbeitnow(keywords, max_pages=arbeitnow_pages)),
+            ("Jobicy", lambda: _from_jobicy(keywords)),
+        ],
+        [
+            (
+                "Arbeitnow (deeper)",
+                lambda: _from_arbeitnow(keywords, max_pages=min(50, arbeitnow_pages + 15)),
+            ),
+            ("Remotive (retry)", lambda: _from_remotive(keywords)),
+            ("Jobicy (retry)", lambda: _from_jobicy(keywords)),
+        ],
     ]
 
-    for name, fetcher in sources:
-        if len(collected) >= min_jobs:
+    for pass_idx, sources in enumerate(source_passes, start=1):
+        if len(collected) >= target:
             break
-        progress(f"Searching {name} for contract roles: {', '.join(keywords[:5])}…", len(collected), failed_urls=failed)
-        try:
-            jobs, errs = fetcher(keywords)
-            failed.extend(errs)
-            for job in jobs:
-                key = (job.url or "").rstrip("/").lower()
-                if not key or key in seen:
-                    continue
-                seen.add(key)
-                collected.append(job)
-                progress(
-                    f"Collected {len(collected)} / {min_jobs} jobs from online search…",
-                    len(collected),
-                    failed_urls=failed,
-                )
-                if len(collected) >= min_jobs:
-                    break
-        except Exception as exc:  # noqa: BLE001
-            failed.append({"url": name, "error": str(exc)})
-            progress(f"{name} failed: {exc}", len(collected), failed_urls=failed)
+        progress(
+            f"Online pass {pass_idx}: filling to {target} contract roles…",
+            len(collected),
+            failed_urls=failed,
+        )
+        grew = False
+        for name, fetcher in sources:
+            if len(collected) >= target:
+                break
+            progress(
+                f"Searching {name} for contract roles: {', '.join(keywords[:5])}…",
+                len(collected),
+                failed_urls=failed,
+            )
+            try:
+                jobs, errs = fetcher()
+                failed.extend(errs)
+                if add_jobs(jobs):
+                    grew = True
+            except Exception as exc:  # noqa: BLE001
+                failed.append({"url": name, "error": str(exc)})
+                progress(f"{name} failed: {exc}", len(collected), failed_urls=failed)
+        if pass_idx > 1 and not grew:
+            break
 
-    # Prefer title hits first
+    # Prefer title hits first, then trim only if we overshot.
     def rank(job: Job) -> Tuple[int, str]:
         title_hit = 0 if matches_keywords(job.title, "", keywords) else 1
         return (title_hit, job.title.lower())
 
     collected.sort(key=rank)
-    collected = collected[: max(min_jobs, min(len(collected), min_jobs))]
+    if len(collected) > target:
+        collected = collected[:target]
 
-    progress(
-        f"Done. Collected {len(collected)} / {min_jobs} contract jobs from online search.",
-        len(collected),
-        failed_urls=failed,
-        finished=True,
-    )
+    if len(collected) < target:
+        progress(
+            f"Stopped at {len(collected)} / {target} — sources exhausted.",
+            len(collected),
+            failed_urls=failed,
+            finished=True,
+        )
+    else:
+        progress(
+            f"Done. Collected {len(collected)} / {target} contract jobs from online search.",
+            len(collected),
+            failed_urls=failed,
+            finished=True,
+        )
     return collected, failed
 
 
