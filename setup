@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# One-time setup: Python venv, backend deps, Playwright, frontend deps.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+
+echo "→ Creating Python virtualenv (.venv)…"
+python3 -m venv .venv
+
+# shellcheck disable=SC1091
+source .venv/bin/activate
+
+echo "→ Installing backend packages…"
+pip install -r backend/requirements.txt
+
+echo "→ Installing Playwright Chromium…"
+playwright install chromium
+
+echo "→ Installing frontend packages…"
+(cd frontend && npm install)
+
+echo
+echo "Setup complete."
+echo "Start the app with:  ./dev"
+echo "Then open:           http://localhost:5173"
